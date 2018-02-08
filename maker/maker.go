@@ -7,11 +7,16 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"io"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/pkg/errors"
-
 	"golang.org/x/tools/imports"
 )
 
@@ -24,11 +29,13 @@ type Maker struct {
 
 	fset *token.FileSet
 
-	importsByPath  map[string]*importedPkg
-	importsByAlias map[string]*importedPkg
-	imports        []*importedPkg
-	methods        []*method
-	methodNames    map[string]struct{}
+	importsByPath        map[string]*importedPkg
+	importsByAlias       map[string]*importedPkg
+	imports              []*importedPkg
+	methods              []*method
+	methodNames          map[string]struct{}
+	srcPackage           string
+	omitGeneratedComment bool
 }
 
 // errorAlias formats the alias for error messages.
@@ -40,9 +47,7 @@ func errorAlias(alias string) string {
 	return alias
 }
 
-// ParseSource parses the source code in src.
-// filename is used for position information only.
-func (m *Maker) ParseSource(src []byte, filename string) error {
+func (m *Maker) init() {
 	if m.fset == nil {
 		m.fset = token.NewFileSet()
 	}
@@ -55,52 +60,66 @@ func (m *Maker) ParseSource(src []byte, filename string) error {
 	if m.methods == nil {
 		m.methodNames = make(map[string]struct{})
 	}
+}
 
-	a, err := parser.ParseFile(m.fset, filename, src, parser.ParseComments)
-	if err != nil {
-		return errors.Wrap(err, "parsing file failed")
-	}
+func (m *Maker) AddImport(alias, path string) {
+	i := &importedPkg{Alias: alias, Path: path}
+	m.imports = append(m.imports, i)
+}
 
-	hasMethods := false
-	for _, d := range a.Decls {
-		if a, fd := m.getReceiverTypeName(d); a == m.StructName {
-			if !fd.Name.IsExported() {
-				continue
-			}
-			hasMethods = true
-			methodName := fd.Name.String()
-			if _, ok := m.methodNames[methodName]; ok {
-				continue
-			}
+func (m *Maker) SourcePackage(p string) {
+	m.srcPackage = p
+}
 
-			params, err := m.printParameters(fd.Type.Params)
-			if err != nil {
-				return errors.Wrap(err, "failed printing parameters")
-			}
-			ret, err := m.printParameters(fd.Type.Results)
-			if err != nil {
-				return errors.Wrap(err, "failed printing return values")
-			}
-			code := fmt.Sprintf("%s(%s) (%s)", methodName, params, ret)
-			var docs []string
-			if fd.Doc != nil && m.CopyDocs {
-				for _, d := range fd.Doc.List {
-					docs = append(docs, d.Text)
-				}
-			}
-			m.methodNames[methodName] = struct{}{}
-			m.methods = append(m.methods, &method{
-				Code: code,
-				Docs: docs,
-			})
+func (m *Maker) OmitGeneratedComment() {
+	m.omitGeneratedComment = true
+}
+
+func (m *Maker) parseDeclarations(astFile *ast.File) (hasMethods bool, err error) {
+	for _, d := range astFile.Decls {
+
+		var a string
+		var fd *ast.FuncDecl
+
+		if a, fd = m.getReceiverTypeName(d); a != m.StructName {
+			continue
 		}
+
+		if !fd.Name.IsExported() {
+			continue
+		}
+
+		hasMethods = true
+		methodName := fd.Name.String()
+		if _, ok := m.methodNames[methodName]; ok {
+			continue
+		}
+
+		method := &method{Docs: []string{}}
+
+		params, err := m.printParameters(fd.Type.Params)
+		if err != nil {
+			return hasMethods, errors.Wrap(err, "failed printing parameters")
+		}
+		ret, err := m.printParameters(fd.Type.Results)
+		if err != nil {
+			return hasMethods, errors.Wrap(err, "failed printing return values")
+		}
+		method.Code = fmt.Sprintf("%s(%s) (%s)", methodName, params, ret)
+
+		if fd.Doc != nil && m.CopyDocs {
+			for _, d := range fd.Doc.List {
+				method.Docs = append(method.Docs, d.Text)
+			}
+		}
+
+		m.methodNames[methodName] = struct{}{}
+		m.methods = append(m.methods, method)
 	}
-	// No point checking imports if there are no relevant methods in this file.
-	// This also avoids throwing unnecessary errors about imports in files that
-	// are not relevant.
-	if !hasMethods {
-		return nil
-	}
+	return
+}
+
+func (m *Maker) parseImports(a *ast.File) error {
 	for _, i := range a.Imports {
 		alias := ""
 		if i.Name != nil {
@@ -128,11 +147,12 @@ func (m *Maker) ParseSource(src []byte, filename string) error {
 			// package name (which might differ from the import path's last element),
 			// and that would require correctly finding the package in GOPATH
 			// or vendor directories.
-			return fmt.Errorf("Package %q imported multiple times with different aliases: %v, %v", path, errorAlias(existing.Alias), errorAlias(alias))
+			format := "package %q imported multiple times with different aliases: %v, %v"
+			return fmt.Errorf(format, path, errorAlias(existing.Alias), errorAlias(alias))
 		} else if !ok {
 			if alias != "" {
 				if _, ok := m.importsByAlias[alias]; ok {
-					return fmt.Errorf("Import alias %v already in use", alias)
+					return fmt.Errorf("import alias %v already in use", alias)
 				}
 			}
 			imp := &importedPkg{
@@ -144,22 +164,73 @@ func (m *Maker) ParseSource(src []byte, filename string) error {
 			m.imports = append(m.imports, imp)
 		}
 	}
+	return nil
+}
+
+// ParseSource parses the source code in src.
+// filename is used for position information only.
+func (m *Maker) ParseDeclarations(src []byte, filename string) (declarations map[string]int32, err error) {
+	m.init()
+
+	declarations = make(map[string]int32)
+	a, err := parser.ParseFile(m.fset, filename, src, parser.ParseComments)
+	if err != nil {
+		return declarations, errors.Wrap(err, "parsing file failed")
+	}
+	for _, d := range a.Decls {
+		a, _ := m.getReceiverTypeName(d)
+		declarations[a]++
+	}
+	return
+}
+
+// ParseSource parses the source code in src.
+// filename is used for position information only.
+func (m *Maker) ParseSource(src []byte, filename string) error {
+	m.init()
+
+	a, err := parser.ParseFile(m.fset, filename, src, parser.ParseComments)
+	if err != nil {
+		return errors.Wrap(err, "parsing file failed")
+	}
+	hasMethods, err := m.parseDeclarations(a)
+	if err != nil {
+		return err
+	}
+
+	// No point checking imports if there are no relevant methods in this file.
+	// This also avoids throwing unnecessary errors about imports in files that
+	// are not relevant.
+	if !hasMethods {
+		return nil
+	}
+
+	err = m.parseImports(a)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
 
 func (m *Maker) makeInterface(pkgName, ifaceName string) string {
-	output := []string{
-		"// Code generated by ifacemaker. DO NOT EDIT.",
-		"",
-		"package " + pkgName,
-		"import (",
+	var output []string
+	if !m.omitGeneratedComment {
+		output = append(output, "// Code generated by ifacemaker. DO NOT EDIT.")
 	}
+	output = append(output, "")
+	output = append(output, "package "+pkgName)
+	output = append(output, "import (")
 	for _, pkgImport := range m.imports {
 		output = append(output, pkgImport.Lines()...)
 	}
+	output = append(output, ")")
+	if m.srcPackage != "" {
+		output = append(output,
+			fmt.Sprintf("var _ %s = (*%s.%s)(nil)", ifaceName, m.srcPackage, m.StructName),
+		)
+	}
 	output = append(output,
-		")",
 		fmt.Sprintf("type %s interface {", ifaceName),
 	)
 	for _, method := range m.methods {
@@ -249,15 +320,101 @@ func (m *Maker) printParameters(fl *ast.FieldList) (string, error) {
 				fmt.Fprint(buff, " ")
 			}
 		}
-		err := printer.Fprint(buff, m.fset, field.Type)
+
+		typeBuff := &bytes.Buffer{}
+		err := printer.Fprint(typeBuff, m.fset, field.Type)
 		if err != nil {
 			return "", errors.Wrap(err, "failed printing parameter type")
 		}
+		buff.Write(m.replaceType(typeBuff).Bytes())
 		if ii < ll-1 {
 			fmt.Fprint(buff, ",")
 		}
 	}
+
 	return buff.String(), nil
+}
+
+func (m *Maker) replaceTypeOld(in *bytes.Buffer) *bytes.Buffer {
+	if m.srcPackage == "" {
+		return in
+	}
+
+	s := in.String()
+
+	// No uppercase then this is not exported
+	if !strings.ContainsAny(s, "ABCDEFGHIGKLMNOPQRSTUVWXYZ") {
+		return in
+	}
+	// Already qualified with a package prefix
+	if strings.Contains(s, ".") {
+		return in
+	}
+
+	funcPrefix, s := removePrefix(s, "func(")
+	chanPrefix, s := removePrefix(s, "chan ", "<-chan ", "chan<- ")
+
+	ptrPrefix, s := removePrefix(s, "*")
+
+	// prepend the source package to the exported type
+	s = funcPrefix + chanPrefix + ptrPrefix + m.srcPackage + "." + s
+
+	return bytes.NewBufferString(s)
+}
+
+func (m *Maker) replaceType(in *bytes.Buffer) (out *bytes.Buffer) {
+	if m.srcPackage == "" {
+		return in
+	}
+	out = &bytes.Buffer{}
+	var err error
+	var r rune
+	var p rune
+
+	// i've got 99 problems but regex isn't one of them
+
+	// https://golang.org/ref/spec#Identifiers
+	isValidTypeRune := func(r rune) bool {
+		return r == rune('_') || unicode.IsLetter(r) || unicode.IsDigit(r)
+	}
+
+	addPrefix := func(current rune, previous rune) bool {
+		// for already qualified
+		if previous == rune('.') {
+			return false
+		}
+		// continuing an identifier
+		if isValidTypeRune(previous) {
+			return false
+		}
+		// not part of an identifier
+		if !isValidTypeRune(current) {
+			return false
+		}
+		// only exported
+		// https://golang.org/ref/spec#Exported_identifiers
+		return unicode.IsUpper(current)
+	}
+
+	for r, _, err = in.ReadRune(); err != io.EOF; {
+		if addPrefix(r, p) {
+			out.WriteString(m.srcPackage + ".")
+		}
+		out.WriteRune(r)
+		p = r
+		r, _, err = in.ReadRune()
+	}
+
+	return out
+}
+
+func removePrefix(s string, variations ...string) (removed string, remainder string) {
+	for _, pfx := range variations {
+		if strings.HasPrefix(s, pfx) {
+			return pfx, strings.TrimPrefix(s, pfx)
+		}
+	}
+	return "", s
 }
 
 func formatCode(code string) ([]byte, error) {
@@ -268,4 +425,79 @@ func formatCode(code string) ([]byte, error) {
 		Comments:  true,
 	}
 	return imports.Process("", []byte(code), opts)
+}
+
+func (m *Maker) GetGoFiles(paths ...string) (allFiles []string, err error) {
+
+	var noFiles []string
+
+	for _, f := range paths {
+		fi, err := os.Stat(f)
+		if err != nil {
+			return noFiles, err
+		}
+		if fi.IsDir() {
+			dir, err := os.Open(f)
+			if err != nil {
+				return noFiles, err
+			}
+			dirFiles, err := dir.Readdir(-1)
+			dir.Close()
+			if err != nil {
+				return noFiles, err
+			}
+			var dirFileNames []string
+			for _, fi := range dirFiles {
+				if !fi.IsDir() && strings.HasSuffix(fi.Name(), ".go") {
+					dirFileNames = append(dirFileNames, filepath.Join(f, fi.Name()))
+				}
+			}
+			sort.Strings(dirFileNames)
+			allFiles = append(allFiles, dirFileNames...)
+		} else {
+			allFiles = append(allFiles, f)
+		}
+	}
+	return allFiles, err
+}
+
+func (m *Maker) ParseFiles(files ...string) error {
+	for _, f := range files {
+		src, err := ioutil.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		err = m.ParseSource(src, filepath.Base(f))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Maker) ReadStructs(files ...string) (allStructs map[string]int32, err error) {
+	allFiles, err := m.GetGoFiles(files...)
+	if err != nil {
+		return allStructs, err
+	}
+
+	allStructs = make(map[string]int32)
+
+	for _, f := range allFiles {
+		src, err := ioutil.ReadFile(f)
+		if err != nil {
+			return allStructs, err
+		}
+
+		st, err := m.ParseDeclarations(src, filepath.Base(f))
+		if err != nil {
+			return allStructs, err
+		}
+
+		for k, v := range st {
+			allStructs[k] += v
+		}
+	}
+
+	return
 }
