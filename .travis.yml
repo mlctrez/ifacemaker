@@ -7,5 +7,5 @@ go:
   - 1.8
   - tip
 sudo: false
-go_import_path: github.com/nkovacs/ifacemaker # required for forks to build properly
+go_import_path: github.com/mlctrez/ifacemaker # required for forks to build properly
 install: scripts/deps.sh
