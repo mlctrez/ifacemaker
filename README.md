@@ -1,7 +1,7 @@
 # ifacemaker
 
 This is a development helper program that generates a Golang interface by inspecting
-the structure methods of an existing `.go` files. The primary use case is to generate
+the structure methods of existing `.go` file(s). The primary use case is to generate
 interfaces for gomock, so that gomock can generate mocks from those interfaces. This
 makes unit testing easier.
 
