@@ -132,7 +132,7 @@ import (
 var _ ICloudFormation = (*cloudformation.CloudFormation)(nil)
 
 type ICloudFormation interface {
-	    // ** *CancelUpdateStackInput rewritten to *cloudformation.CancelUpdateStackInput
+        // ** *CancelUpdateStackInput rewritten to *cloudformation.CancelUpdateStackInput
         CancelUpdateStackRequest(input *cloudformation.CancelUpdateStackInput) (req *request.Request, output *cloudformation.CancelUpdateStackOutput)
         CancelUpdateStack(input *cloudformation.CancelUpdateStackInput) (*cloudformation.CancelUpdateStackOutput, error)
         CancelUpdateStackWithContext(ctx aws.Context, input *cloudformation.CancelUpdateStackInput, opts ...request.Option) (*cloudformation.CancelUpdateStackOutput, error)
