@@ -35,8 +35,8 @@ Options:
 $
 ```
 
-As an example, let's say you wanted to generate an interface for the Human structure
-in this sample code:
+As an example, let's say you wanted to generate an interface for all methods on the
+Human struct in this sample code:
 
 ```
 package main
@@ -99,8 +99,44 @@ parameter:
 
 ```
 $ ifacemaker -f human.go -s Human -i HumanIface -p humantest -o humaniface.go
-$
 ```
+
+## Additional Imports / Rewrite
 
 Field and return types in the generated interface can be re-written to include the source package name.
 See `scripts/sample.sh` for example usage of the `--add-import` and `--rewrite` args.
+
+A short example
+
+```bash
+$ ifacemaker --file ~/go/src/github.com/aws/aws-sdk-go/service/cloudformation/api.go \
+  --struct CloudFormation --iface ICloudFormation --pkg icloud \
+  --doc=false --rewrite cloudformation
+```
+
+results in this (truncated) output 
+
+`// **` comments explain additional generated code
+
+```go
+package icloud
+
+import (
+        "github.com/aws/aws-sdk-go/aws"
+        "github.com/aws/aws-sdk-go/aws/request"
+        // ** additional import added
+        "github.com/aws/aws-sdk-go/service/cloudformation"
+)
+
+// ** checks that the interface implements all of the original api
+var _ ICloudFormation = (*cloudformation.CloudFormation)(nil)
+
+type ICloudFormation interface {
+	    // ** *CancelUpdateStackInput rewritten to *cloudformation.CancelUpdateStackInput
+        CancelUpdateStackRequest(input *cloudformation.CancelUpdateStackInput) (req *request.Request, output *cloudformation.CancelUpdateStackOutput)
+        CancelUpdateStack(input *cloudformation.CancelUpdateStackInput) (*cloudformation.CancelUpdateStackOutput, error)
+        CancelUpdateStackWithContext(ctx aws.Context, input *cloudformation.CancelUpdateStackInput, opts ...request.Option) (*cloudformation.CancelUpdateStackOutput, error)
+        // remainder omitted
+}
+        
+```
